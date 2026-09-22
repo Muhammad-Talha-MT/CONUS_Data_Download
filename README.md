@@ -343,12 +343,6 @@ should be confirmed against Frontier's own current documentation or
   with these sources without a hand-built Manning's-equation
   approximation from NWM's channel geometry parameters. This pipeline
   fully supports a Q-only (streamflow) approach.
-- **CAMELSH coverage is basin-dependent and not reliably rich** — its
-  hourly curation showed near-zero coverage for French Broad specifically
-  (17 of 18 matched gauges had 0 data-availability hours), while the same
-  gauges have real, decades-long records directly in NWIS.
-  `06_download_nwis_iv.py` is the more dependable sparse-gauge source
-  found so far; this may or may not hold for every basin.
 - **The nearest-cell forcing aggregation is a real approximation, not
   exact area-weighting.** At ERA5-Land's ~9km / NLDAS-2's ~12km
   resolution vs. typical NHDPlus catchments of a few km², multiple small
