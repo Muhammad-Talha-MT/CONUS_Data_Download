@@ -1,52 +1,68 @@
 #!/usr/bin/env python3
 """
-04_download_forcing.py  (CONUS-optimized, NLDAS-2)
+04_download_forcing.py  (NLDAS-2, rewritten to use Google Earth Engine)
 
-Dense, per-reach forcing using NLDAS-2 (NLDAS_FORA0125_H v2.0) -- the
-alternate forcing source (ERA5-Land, 04_download_forcing_era5land.py, is
-recommended for CONUS-scale runs due to NLDAS-2's one-file-per-hour
-distribution; this script remains for basins/eras where NLDAS-2 is
-specifically wanted).
+Dense, per-reach forcing using NLDAS-2 (NLDAS_FORA0125_H v2.0), now pulled
+through Google Earth Engine instead of NASA GES DISC/earthaccess.
 
-SAME CRITICAL FIX AS 04_download_forcing_era5land.py, applied here too
-(see that script's docstring for the full reasoning): the original built
-one Python table holding every reach x every hour of a year before a
-single write -- at CONUS scale, ~23.7 billion rows for one year alone.
-Output is now one file per (year, node-chunk):
+WHY THIS CHANGED: the previous version downloaded one file PER HOUR
+(~385,000 files for the full 1979-present record) and did the
+catchment-to-nearest-cell reduction locally, after transfer. Earth Engine
+publishes the same product (NASA/NLDAS/FORA0125_H002) and lets that
+reduction happen SERVER-SIDE instead: `image.reduceRegions(catchments,
+reducer, scale)` computes the zonal mean directly against each
+catchment's real polygon, for every hour in a date range, and only the
+resulting small table (reach x hour x variable) is ever transferred --
+the underlying hourly grids never leave Google's infrastructure. This is
+a genuine architectural improvement, not just a faster way to fetch the
+same bytes: it also replaces the old nearest-grid-cell approximation with
+a real area-weighted zonal mean over each catchment's actual shape.
 
-    forcing/{region}_forcing_{year}_chunk{i:04d}.parquet
-
-Catchment fetching now runs with bounded concurrency (pipeline_utils.
-parallel_map) instead of a strict serial loop, same as the ERA5-Land
-script.
-
-NLDAS-2's own SCALE NOTE still applies unchanged: the ~385,000-granule
-full-record file count is driven by TIME range, not area, and does not
-get better or worse from this pass's changes -- ERA5-Land remains the
-better choice for a genuinely CONUS-scale run for that reason alone.
+*** NOT YET BENCHMARKED AT SCALE. *** This has been written against Earth
+Engine's documented API and the collection's confirmed availability, but
+-- same discipline as every other new source in this pipeline -- run
+--inspect first, then a small HUC8 test, before trusting it at CONUS
+scale. In particular: mapping reduceRegions over many hourly images in one
+export task is a real, well-known way to hit Earth Engine's server-side
+"user memory limit exceeded" error; --time-chunk-days exists specifically
+to let you shrink each export task if that happens, and the default here
+(31 days) is a conservative starting point, not a tuned value.
 
 One-time setup:
-    1. Create a free account: https://urs.earthdata.nasa.gov/
-    2. Either run `earthaccess.login()` once interactively, or set
-       EARTHDATA_USERNAME / EARTHDATA_PASSWORD, or add a ~/.netrc entry.
+    1. Register/enable Earth Engine for a Google Cloud project you control:
+       https://code.earthengine.google.com/
+    2. pip install earthengine-api google-cloud-storage
+    3. Run `earthengine authenticate` once (or let this script call
+       ee.Authenticate() interactively the first time it runs).
+    4. export GEE_PROJECT=<your-gcp-project-id>
+    5. export GEE_EXPORT_GCS_BUCKET=<a GCS bucket you can write to> --
+       Earth Engine table exports land here as an intermediate step;
+       this script downloads each export then deletes the GCS copy.
 
-Requires: earthaccess, xarray, pynhd, geopandas, shapely, pandas, pyarrow
+Output is unchanged from the previous version, so nothing downstream in
+this pipeline needs to change:
+    forcing/{region}_forcing_{year}_chunk{i:04d}.parquet
+    columns: time, comid, Rainf, Tair, Qair, Wind_E, Wind_N, PSurf, SWdown, LWdown
+
+Requires: earthengine-api, google-cloud-storage, pynhd, geopandas, shapely, pandas, pyarrow
 Usage:
     python 04_download_forcing.py --inspect
-    python 04_download_forcing.py --outdir ./output --region CONUS --node-chunk-size 5000
+    python 04_download_forcing.py --outdir ./test_output --region 06010105
+    python 04_download_forcing.py --outdir ./output --region CONUS --node-chunk-size 5000 --time-chunk-days 31
 """
 
 import argparse
+import os
 import sys
+import time
 
-import numpy as np
 import pandas as pd
-import xarray as xr
 
 from config import (
     DEFAULT_REGION,
-    NLDAS2_SHORT_NAME,
-    NLDAS2_VERSION,
+    NLDAS2_GEE_COLLECTION,
+    NLDAS2_GEE_BAND_MAP,
+    NLDAS2_GEE_SCALE_M,
     NLDAS2_START,
     NLDAS2_END,
     NLDAS2_VARIABLES,
@@ -54,58 +70,61 @@ from config import (
     DOWNLOAD_MAX_WORKERS,
     make_dirs,
 )
-from pipeline_utils import chunked, parallel_map, retry_with_backoff
+from pipeline_utils import chunked, parallel_map
 
 
-def earthdata_login():
-    import earthaccess
-
-    auth = earthaccess.login()
-    if not auth.authenticated:
-        raise RuntimeError(
-            "Earthdata authentication failed. Set EARTHDATA_USERNAME/EARTHDATA_PASSWORD, "
-            "add a ~/.netrc entry for urs.earthdata.nasa.gov, or run earthaccess.login() "
-            "interactively first. Create an account at https://urs.earthdata.nasa.gov/"
-        )
-    return auth
-
-
-def search_year_granules(year: int, start: str, end: str):
-    import earthaccess
-
-    year_start = max(pd.Timestamp(start), pd.Timestamp(f"{year}-01-01"))
-    year_end = min(pd.Timestamp(end), pd.Timestamp(f"{year}-12-31 23:59"))
-    return earthaccess.search_data(
-        short_name=NLDAS2_SHORT_NAME, version=NLDAS2_VERSION,
-        temporal=(year_start.isoformat(), year_end.isoformat()),
-    )
-
-
-def inspect_one_granule():
-    import earthaccess
-
-    earthdata_login()
-    print(f"Searching for one {NLDAS2_SHORT_NAME} v{NLDAS2_VERSION} granule to inspect ...")
-    results = earthaccess.search_data(
-        short_name=NLDAS2_SHORT_NAME, version=NLDAS2_VERSION,
-        temporal=(NLDAS2_START, "1979-01-02"), count=1,
-    )
-    if not results:
-        print("No granules found -- check credentials and dataset short_name/version.", file=sys.stderr)
+def get_gee_project():
+    project = os.environ.get("GEE_PROJECT")
+    if not project:
+        print("ERROR: GEE_PROJECT environment variable not set. Register/enable Earth Engine "
+              "for a Google Cloud project at https://code.earthengine.google.com/ and run: "
+              "export GEE_PROJECT=<your-gcp-project-id>", file=sys.stderr)
         sys.exit(1)
-    files = earthaccess.open(results)
-    ds = xr.open_dataset(files[0], engine="h5netcdf")
-    print("Dims:", dict(ds.dims))
-    print("Coords:", list(ds.coords))
-    print("Data variables:", list(ds.data_vars))
-    for v in NLDAS2_VARIABLES:
-        print(f"  expected var '{v}' present: {v in ds.data_vars}")
-    print("Global attrs:", dict(ds.attrs))
+    return project
+
+
+def get_gcs_bucket():
+    bucket = os.environ.get("GEE_EXPORT_GCS_BUCKET")
+    if not bucket:
+        print("ERROR: GEE_EXPORT_GCS_BUCKET environment variable not set. Earth Engine table "
+              "exports need a GCS bucket to land in first. export GEE_EXPORT_GCS_BUCKET=<bucket>", file=sys.stderr)
+        sys.exit(1)
+    return bucket
+
+
+def ee_init():
+    import ee
+
+    project = get_gee_project()
+    try:
+        ee.Initialize(project=project)
+    except Exception:
+        ee.Authenticate()
+        ee.Initialize(project=project)
+    return ee
+
+
+def inspect_collection():
+    ee = ee_init()
+    ic = ee.ImageCollection(NLDAS2_GEE_COLLECTION)
+    first = ic.first()
+    print(f"Collection: {NLDAS2_GEE_COLLECTION}")
+    print("Band names in first image:", first.bandNames().getInfo())
+    print(f"\nRequested variables (config.NLDAS2_VARIABLES) -> Earth Engine band mapping:")
+    band_names = set(first.bandNames().getInfo())
+    for var, band in NLDAS2_GEE_BAND_MAP.items():
+        present = band in band_names
+        print(f"  {var:>8} -> {band:<22} present: {present}")
+    print(f"\nNative pixel size (config.NLDAS2_GEE_SCALE_M): {NLDAS2_GEE_SCALE_M} m -- "
+          f"confirm this against the collection's own catalog page if in doubt.")
+    print("\nIf any band is missing or the mapping looks wrong, check this collection's band "
+          "descriptions on its Earth Engine catalog page before trusting NLDAS2_GEE_BAND_MAP "
+          "in config.py.")
 
 
 def fetch_catchments(feature_ids, chunk_size=200, max_workers=DOWNLOAD_MAX_WORKERS,
                       retry_chunk_size=20, max_retry_rounds=3):
-    """Same threaded fetch + retry-rounds logic as 04_download_forcing_era5land.py."""
+    """Same threaded fetch + retry-rounds logic used by 04_download_forcing_era5land.py."""
     from pynhd import WaterData
     import geopandas as gpd
 
@@ -148,29 +167,105 @@ def fetch_catchments(feature_ids, chunk_size=200, max_workers=DOWNLOAD_MAX_WORKE
     return catchments.drop_duplicates(subset="featureid").reset_index(drop=True)
 
 
-def build_catchment_to_cell_map(lat, lon, catchments_wgs84):
-    minx, miny, maxx, maxy = catchments_wgs84.total_bounds
-    buffer = 0.15
-    lat_mask = (lat >= miny - buffer) & (lat <= maxy + buffer)
-    lon_mask = (lon >= minx - buffer) & (lon <= maxx + buffer)
+def catchments_to_ee_featurecollection(ee, catchments_chunk_gdf):
+    """
+    Build an ee.FeatureCollection from a node-chunk's catchment polygons,
+    simplified slightly to keep the upload payload and server-side
+    computation reasonable -- full-resolution NHDPlus catchment boundaries
+    are far more detail than a ~12km grid's zonal mean needs.
+    """
+    features = []
+    for _, row in catchments_chunk_gdf.iterrows():
+        geom = row.geometry.simplify(0.0005, preserve_topology=True)
+        ee_geom = ee.Geometry(geom.__geo_interface__)
+        features.append(ee.Feature(ee_geom, {"comid": int(row["featureid"])}))
+    return ee.FeatureCollection(features)
 
-    lat_sel = lat[lat_mask]
-    lon_sel = lon[lon_mask]
-    print(f"  Bounding box subset: {len(lat_sel)} x {len(lon_sel)} = {len(lat_sel) * len(lon_sel)} cells")
 
-    centroids = catchments_wgs84.geometry.centroid
-    cat_lat = centroids.y.values
-    cat_lon = centroids.x.values
-    comids = catchments_wgs84["featureid"].values
+def month_windows(start: pd.Timestamp, end: pd.Timestamp, chunk_days: int):
+    """Split [start, end] into consecutive windows of at most chunk_days days."""
+    windows = []
+    cur = start
+    while cur <= end:
+        nxt = min(cur + pd.Timedelta(days=chunk_days), end + pd.Timedelta(seconds=1))
+        windows.append((cur, nxt))
+        cur = nxt
+    return windows
 
-    lat_idx = np.abs(lat_sel[:, None] - cat_lat[None, :]).argmin(axis=0)
-    lon_idx = np.abs(lon_sel[:, None] - cat_lon[None, :]).argmin(axis=0)
-    flat_cell_idx = lat_idx * len(lon_sel) + lon_idx
 
-    n_unique_cells = len(set(flat_cell_idx.tolist()))
-    print(f"  {len(comids)} catchments mapped to {n_unique_cells} distinct grid cells")
+def export_window(ee, fc, bands_ee, window_start, window_end, description, bucket, prefix):
+    ic = (
+        ee.ImageCollection(NLDAS2_GEE_COLLECTION)
+        .filterDate(window_start.isoformat(), window_end.isoformat())
+        .select(bands_ee)
+    )
 
-    return lat_mask, lon_mask, flat_cell_idx, comids, len(lat_sel), len(lon_sel)
+    def _reduce_one_image(image):
+        stats = image.reduceRegions(collection=fc, reducer=ee.Reducer.mean(), scale=NLDAS2_GEE_SCALE_M)
+        t = image.date().format("YYYY-MM-dd'T'HH:mm:ss")
+        return stats.map(lambda f: f.set("time", t))
+
+    table = ic.map(_reduce_one_image).flatten()
+    task = ee.batch.Export.table.toCloudStorage(
+        collection=table, description=description, bucket=bucket,
+        fileNamePrefix=prefix, fileFormat="CSV",
+    )
+    task.start()
+    return task
+
+
+def wait_for_tasks(tasks, poll_s=20, label="export"):
+    """Poll a batch of Earth Engine tasks to completion. Returns (done, failed) task lists."""
+    pending = list(tasks)
+    done, failed = [], []
+    while pending:
+        time.sleep(poll_s)
+        still_pending = []
+        for task in pending:
+            state = task.status()["state"]
+            if state == "COMPLETED":
+                done.append(task)
+            elif state in ("FAILED", "CANCELLED"):
+                failed.append(task)
+                print(f"  {label} task FAILED: {task.status().get('error_message', 'unknown error')}", file=sys.stderr)
+            else:
+                still_pending.append(task)
+        pending = still_pending
+        if pending:
+            print(f"  {label}: {len(done)} done, {len(failed)} failed, {len(pending)} still running ...")
+    return done, failed
+
+
+def download_and_merge_gcs_csvs(bucket_name, prefix, band_to_var):
+    """
+    Earth Engine table exports can shard into multiple CSV files
+    (prefix-00000-of-00002.csv, etc.) for large tables. Download every
+    blob matching the prefix, concatenate, rename EE band columns back to
+    the pipeline's canonical variable names, and drop EE's extra columns
+    (.geo, system:index) that aren't part of our output schema.
+    """
+    from google.cloud import storage
+
+    client = storage.Client()
+    blobs = list(client.list_blobs(bucket_name, prefix=prefix))
+    if not blobs:
+        raise RuntimeError(f"No export files found in gs://{bucket_name}/{prefix}*")
+
+    frames = []
+    for blob in blobs:
+        local_tmp = f"/tmp/{blob.name.split('/')[-1]}"
+        blob.download_to_filename(local_tmp)
+        frames.append(pd.read_csv(local_tmp))
+        os.remove(local_tmp)
+        blob.delete()  # clean up the GCS intermediate copy
+
+    combined = pd.concat(frames, ignore_index=True)
+    var_to_band = {v: k for k, v in band_to_var.items()}
+    rename_map = {ee_band: var for ee_band, var in var_to_band.items() if ee_band in combined.columns}
+    combined = combined.rename(columns=rename_map)
+    drop_cols = [c for c in (".geo", "system:index") if c in combined.columns]
+    combined = combined.drop(columns=drop_cols)
+    return combined
 
 
 def main():
@@ -183,13 +278,19 @@ def main():
     parser.add_argument("--catchment-chunk-size", type=int, default=200)
     parser.add_argument("--catchment-workers", type=int, default=DOWNLOAD_MAX_WORKERS)
     parser.add_argument("--node-chunk-size", type=int, default=NODE_CHUNK_SIZE_DEFAULT,
-                         help=f"Reaches per OUTPUT file (default: {NODE_CHUNK_SIZE_DEFAULT})")
-    parser.add_argument("--inspect", action="store_true",
-                         help="Open one granule, print its structure, and exit (no bulk download)")
+                         help=f"Reaches per OUTPUT file AND per Earth Engine FeatureCollection "
+                              f"(default: {NODE_CHUNK_SIZE_DEFAULT})")
+    parser.add_argument("--time-chunk-days", type=int, default=31,
+                         help="Days per Earth Engine export task (default: 31 -- conservative "
+                              "starting point; lower this if you hit a 'user memory limit "
+                              "exceeded' error from Earth Engine)")
+    parser.add_argument("--max-concurrent-tasks", type=int, default=8,
+                         help="Cap on simultaneously running Earth Engine export tasks (default: 8)")
+    parser.add_argument("--inspect", action="store_true", help="RUN THIS FIRST")
     args = parser.parse_args()
 
     if args.inspect:
-        inspect_one_granule()
+        inspect_collection()
         return
 
     dirs = make_dirs(args.outdir)
@@ -200,110 +301,82 @@ def main():
     feature_ids = sorted(int(c) for c in pd.read_parquet(nodes_path)["comid"].dropna().unique())
     print(f"Loaded {len(feature_ids)} feature_id(s) for region {args.region}")
 
-    print("Authenticating with NASA Earthdata ...")
-    earthdata_login()
+    bucket = get_gcs_bucket()
+    ee = ee_init()
+
+    available_vars = [v for v in args.variables if v in NLDAS2_GEE_BAND_MAP]
+    missing = set(args.variables) - set(available_vars)
+    if missing:
+        print(f"WARNING: variables not in NLDAS2_GEE_BAND_MAP: {missing}", file=sys.stderr)
+    if not available_vars:
+        print("ERROR: none of the requested variables are mapped to an Earth Engine band.", file=sys.stderr)
+        sys.exit(1)
+    bands_ee = [NLDAS2_GEE_BAND_MAP[v] for v in available_vars]
+    band_to_var = {NLDAS2_GEE_BAND_MAP[v]: v for v in available_vars}
+    print(f"  Using variables: {available_vars} -> Earth Engine bands: {bands_ee}")
 
     print("Fetching NHDPlus catchment polygons ...")
     catchments = fetch_catchments(feature_ids, chunk_size=args.catchment_chunk_size,
                                    max_workers=args.catchment_workers)
     print(f"  Retrieved {len(catchments)} catchment polygons")
 
-    print("Building the cell-to-catchment map from one reference granule ...")
-    import earthaccess
-
-    ref_start = pd.Timestamp(args.start)
-    ref_end = ref_start + pd.Timedelta(days=7)
-    ref_results = earthaccess.search_data(
-        short_name=NLDAS2_SHORT_NAME, version=NLDAS2_VERSION,
-        temporal=(ref_start.isoformat(), ref_end.isoformat()), count=1,
-    )
-    if not ref_results:
-        print(f"ERROR: no {NLDAS2_SHORT_NAME} v{NLDAS2_VERSION} granule found between "
-              f"{ref_start.isoformat()} and {ref_end.isoformat()}.", file=sys.stderr)
-        sys.exit(1)
-    ref_file = earthaccess.open(ref_results)[0]
-    ref_ds = xr.open_dataset(ref_file, engine="h5netcdf")
-    lat = ref_ds["lat"].values
-    lon = ref_ds["lon"].values
-
-    lat_mask, lon_mask, flat_cell_idx, comids, nlat, nlon = build_catchment_to_cell_map(lat, lon, catchments)
-    comid_to_cell = dict(zip(comids.tolist(), flat_cell_idx.tolist()))
-
-    approx_hours_per_year = 8784
-    available_vars = [v for v in args.variables if v in ref_ds.data_vars]
-    missing = set(args.variables) - set(available_vars)
-    if missing:
-        print(f"WARNING: variables not found in granule: {missing}. "
-              f"Available: {list(ref_ds.data_vars)}.", file=sys.stderr)
-    if not available_vars:
-        print("ERROR: none of the requested variables exist in this dataset.", file=sys.stderr)
-        sys.exit(1)
-
-    est_gb = approx_hours_per_year * nlat * nlon * 8 * len(available_vars) / 1e9
-    print(f"  Grid subset: {nlat} x {nlon} = {nlat * nlon} cells -> ~{est_gb:.2f} GB in memory per "
-          f"full-year grid load (ALL {len(available_vars)} variable(s) together). This does NOT grow "
-          f"with region/reach count. Output-table memory is bounded separately by "
-          f"--node-chunk-size={args.node_chunk_size}, independent of this region's total "
-          f"{len(feature_ids)} reaches.")
-
     node_chunks = chunked(feature_ids, args.node_chunk_size)
-    print(f"  {len(node_chunks)} output node-chunk(s) of up to {args.node_chunk_size} reaches each")
+    print(f"  {len(node_chunks)} node-chunk(s) of up to {args.node_chunk_size} reaches each")
 
     years = range(pd.Timestamp(args.start).year, pd.Timestamp(args.end).year + 1)
+    run_tag = f"nldas2_{args.region}"
 
     for year in years:
-        pending_chunks = [
-            i for i in range(len(node_chunks))
-            if not (dirs["forcing"] / f"{args.region}_forcing_{year}_chunk{i:04d}.parquet").exists()
-        ]
-        if not pending_chunks:
-            print(f"[{year}] all {len(node_chunks)} node-chunk(s) already exist, skipping")
-            continue
+        year_start = max(pd.Timestamp(args.start), pd.Timestamp(f"{year}-01-01"))
+        year_end = min(pd.Timestamp(args.end), pd.Timestamp(f"{year}-12-31 23:00"))
 
-        print(f"[{year}] searching granules ...")
-        granules = search_year_granules(year, args.start, args.end)
-        if not granules:
-            print(f"[{year}] no granules found, skipping", file=sys.stderr)
-            continue
-        print(f"[{year}] {len(granules)} hourly granules found")
-
-        def _open_and_load():
-            files = earthaccess.open(granules)
-            ds = xr.open_mfdataset(
-                files, combine="nested", concat_dim="time",
-                data_vars=available_vars, coords="minimal", compat="override",
-                engine="h5netcdf",
-            )
-            sub = ds[available_vars].isel(lat=lat_mask, lon=lon_mask)
-            sub = sub.sortby("time")
-            return sub.load()
-
-        arr = retry_with_backoff(_open_and_load, max_attempts=3, wait_s=30, label=f"[{year}] year load")
-        if arr is None:
-            print(f"[{year}] FAILED after retries -- re-run later to retry this year.", file=sys.stderr)
-            continue
-
-        arr_time = arr["time"].values
-        ntime = len(arr_time)
-        flat_by_var = {var: arr[var].values.reshape(ntime, nlat * nlon) for var in available_vars}
-
-        written = 0
-        for i in pending_chunks:
+        for i, chunk_ids in enumerate(node_chunks):
             out_path = dirs["forcing"] / f"{args.region}_forcing_{year}_chunk{i:04d}.parquet"
-            chunk_ids = node_chunks[i]
-            chunk_comids_present = [c for c in chunk_ids if c in comid_to_cell]
-            if not chunk_comids_present:
+            if out_path.exists():
+                print(f"[{year}][chunk {i}] already exists, skipping")
                 continue
-            chunk_cells = [comid_to_cell[c] for c in chunk_comids_present]
-            ncomid = len(chunk_comids_present)
-            data = {var: flat_by_var[var][:, chunk_cells].ravel() for var in available_vars}
-            time_col = np.repeat(arr_time, ncomid)
-            comid_col = np.tile(chunk_comids_present, ntime)
-            combined = pd.DataFrame({"time": time_col, "comid": comid_col, **data})
-            combined.to_parquet(out_path, index=False)
-            written += 1
 
-        print(f"[{year}] wrote {written}/{len(pending_chunks)} node-chunk file(s)")
+            chunk_catchments = catchments[catchments["featureid"].isin(chunk_ids)]
+            if chunk_catchments.empty:
+                print(f"[{year}][chunk {i}] no catchments found for this chunk, skipping", file=sys.stderr)
+                continue
+            fc = catchments_to_ee_featurecollection(ee, chunk_catchments)
+
+            windows = month_windows(year_start, year_end, args.time_chunk_days)
+            print(f"[{year}][chunk {i}] {len(chunk_catchments)} catchments, "
+                  f"{len(windows)} time-window export task(s) ...")
+
+            tasks, task_meta = [], {}
+            for w_idx, (w_start, w_end) in enumerate(windows):
+                prefix = f"{run_tag}/{year}/chunk{i:04d}/window{w_idx:03d}"
+                description = f"{run_tag}_{year}_c{i:04d}_w{w_idx:03d}"
+                task = export_window(ee, fc, bands_ee, w_start, w_end, description, bucket, prefix)
+                tasks.append(task)
+                task_meta[task] = prefix
+
+                # Throttle: don't let more than --max-concurrent-tasks run at once
+                while sum(1 for t in tasks if t.status()["state"] in ("READY", "RUNNING")) >= args.max_concurrent_tasks:
+                    time.sleep(15)
+
+            done, failed = wait_for_tasks(tasks, label=f"[{year}][chunk {i}]")
+            if failed:
+                print(f"[{year}][chunk {i}] {len(failed)}/{len(windows)} window(s) failed -- "
+                      f"re-run this command to retry the whole chunk (Earth Engine tasks aren't "
+                      f"individually resumable, so a partial chunk failure means redoing the "
+                      f"chunk's windows next run).", file=sys.stderr)
+                continue
+
+            window_frames = []
+            for task in done:
+                prefix = task_meta[task]
+                window_frames.append(download_and_merge_gcs_csvs(bucket, prefix, band_to_var))
+
+            combined = pd.concat(window_frames, ignore_index=True)
+            combined["time"] = pd.to_datetime(combined["time"])
+            keep_cols = ["time", "comid"] + available_vars
+            combined = combined[[c for c in keep_cols if c in combined.columns]]
+            combined.to_parquet(out_path, index=False)
+            print(f"[{year}][chunk {i}] wrote {out_path} ({len(combined)} rows)")
 
     print("Done.")
 

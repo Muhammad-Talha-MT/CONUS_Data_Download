@@ -70,7 +70,7 @@ cdse_common.py           -- shared Copernicus Data Space Ecosystem (CDSE) S3 + c
 02_download_streamflow.py         -- NWM v3.0 streamflow, dense, every reach                       [Red]
 03_download_groundwater.py        -- NWM v3.0 groundwater, dense, every reach                      [Red]
 04_download_forcing_era5land.py   -- ERA5-Land forcing, dense, every reach (RECOMMENDED)            [Red]
-04_download_forcing.py            -- NLDAS-2 forcing, dense, every reach (alternate, slower)        [Orange]
+04_download_forcing.py            -- NLDAS-2 forcing, dense, every reach (via Google Earth Engine)   [Orange]
 05_download_camelsh.py            -- CAMELSH sparse fine-tuning gauges                              [Yellow]
 06_download_nwis_iv.py            -- NWIS surface-water fine-tuning gauges (RECOMMENDED)             [Red]
 07_download_nwis_groundwater.py   -- NWIS groundwater-level observations                            [Red]
@@ -147,8 +147,9 @@ discovering a missing credential mid-run:
 
 | Provider | Used by | Setup |
 |---|---|---|
-| **NASA Earthdata** | NLDAS-2 (`04`), SMAP L4 (`14`), Sentinel-6 (`18`) | Register: https://urs.earthdata.nasa.gov/ — then **authorize "NASA GESDISC DATA ARCHIVE"** under your account's Applications settings (easy to miss, causes silent `403`s if skipped). Set via `~/.netrc`, `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD`, or `earthaccess.login()` interactively once. |
+| **NASA Earthdata** | SMAP L4 (`14`), Sentinel-6 (`18`) | Register: https://urs.earthdata.nasa.gov/ — then **authorize "NASA GESDISC DATA ARCHIVE"** under your account's Applications settings (easy to miss, causes silent `403`s if skipped). Set via `~/.netrc`, `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD`, or `earthaccess.login()` interactively once. |
 | **DestinE Earth Data Hub (EDH)** | ERA5-Land (`04_..._era5land.py`) | Register: https://earthdatahub.destine.eu/ — get a token, `export EDH_TOKEN=<token>` |
+| **Google Earth Engine + Cloud Storage** | NLDAS-2 (`04_download_forcing.py`) | **Changed** — this script now pulls NLDAS-2 through Earth Engine's server-side zonal reduction instead of per-hour NASA GES DISC granules (see the script's own docstring for why). Register/enable Earth Engine for a Google Cloud project at https://code.earthengine.google.com/, `pip install earthengine-api google-cloud-storage`, run `earthengine authenticate` once, then `export GEE_PROJECT=<project-id>` and `export GEE_EXPORT_GCS_BUCKET=<a bucket you can write to>` (exports land here as an intermediate step; the script downloads and deletes them). **Not yet benchmarked at CONUS scale** — run `--inspect` then a HUC8 test before trusting it at scale, same as any new source in this pipeline. |
 | **HydroFrame** | ParFlow-CONUS2 (`10`) | Create an account + register your API PIN — see "Creating a HydroFrame API Account" in the hf_hydrodata docs: https://hf-hydrodata.readthedocs.io/ |
 | **Globus** | GRFR (`12`) | Most institutions (incl. national labs) already provide a Globus identity — confirm at https://app.globus.org. Register your own native-app OAuth client at https://app.globus.org/settings/developers (don't reuse someone else's) and set it via `config.GRFR_GLOBUS_CLIENT_ID` or `--client-id`. Run `python 12_download_grfr.py --login` once. |
 | **Copernicus Data Space Ecosystem (CDSE)** | Sentinel-1 (`16`), Sentinel-3 (`17`) | Register: https://dataspace.copernicus.eu/ — generate **S3 credentials** (separate from your login password), `export CDSE_S3_ACCESS_KEY=...` and `export CDSE_S3_SECRET_KEY=...` |
@@ -292,6 +293,18 @@ before finishing a full national run. Full file-by-file detail is in
   HU4/HUC8 tiles, product files) now run with bounded thread-pool
   concurrency (`pipeline_utils.parallel_map`, typically 4–8 workers)
   instead of strictly serially.
+- **`04_download_forcing.py` (NLDAS-2) now uses Google Earth Engine
+  instead of NASA GES DISC/earthaccess.** The original downloaded one
+  file per hour (~385,000 for the full record) and reduced to
+  nearest-grid-cell locally after transfer. Earth Engine hosts the same
+  product (`NASA/NLDAS/FORA0125_H002`) and supports server-side zonal
+  reduction against each catchment's real polygon — the full grids never
+  leave Google's infrastructure, only the small resulting table does.
+  This is a genuine architectural fix, not just a faster fetch, and it
+  also replaces the old nearest-cell approximation with a real
+  area-weighted zonal mean. **Not yet benchmarked at CONUS scale** — see
+  §4's credentials entry and the script's own docstring for the caveats
+  (Earth Engine per-task compute limits in particular).
 - **`region.py` is a reconstruction, not the team's original.** It wasn't
   available when this pass was done, so its tiling/filtering logic was
   rebuilt from the interface the other scripts expect — **if the team's
@@ -343,6 +356,12 @@ should be confirmed against Frontier's own current documentation or
   with these sources without a hand-built Manning's-equation
   approximation from NWM's channel geometry parameters. This pipeline
   fully supports a Q-only (streamflow) approach.
+- **CAMELSH coverage is basin-dependent and not reliably rich** — its
+  hourly curation showed near-zero coverage for French Broad specifically
+  (17 of 18 matched gauges had 0 data-availability hours), while the same
+  gauges have real, decades-long records directly in NWIS.
+  `06_download_nwis_iv.py` is the more dependable sparse-gauge source
+  found so far; this may or may not hold for every basin.
 - **The nearest-cell forcing aggregation is a real approximation, not
   exact area-weighting.** At ERA5-Land's ~9km / NLDAS-2's ~12km
   resolution vs. typical NHDPlus catchments of a few km², multiple small
